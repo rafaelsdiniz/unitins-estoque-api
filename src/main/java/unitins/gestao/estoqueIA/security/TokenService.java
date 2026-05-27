@@ -26,9 +26,14 @@ public class TokenService {
     private long expirationSeconds;
 
     public String gerarToken(Authentication authentication) {
+        // Apenas os papéis (ROLE_*) entram no scope. O Spring Security 7 adiciona
+        // authorities de fator de autenticação (ex.: FACTOR_PASSWORD) após o login,
+        // que não devem poluir o claim — manteria o scope inconsistente com o refresh
+        // e quebraria a checagem de papel no frontend.
         String scope = authentication.getAuthorities().stream()
                 .map(GrantedAuthority::getAuthority)
-                .map(a -> a.startsWith("ROLE_") ? a.substring(5) : a)
+                .filter(a -> a.startsWith("ROLE_"))
+                .map(a -> a.substring(5))
                 .collect(Collectors.joining(" "));
         return montar(authentication.getName(), scope);
     }

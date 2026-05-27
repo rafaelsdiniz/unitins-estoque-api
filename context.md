@@ -1,8 +1,10 @@
-# estoqueIA — Contexto do projeto
+# estoqueIA — Contexto do projeto (backend)
 
 > Documentação viva. Atualizar a cada mudança significativa (nova feature, endpoint, dependência, decisão arquitetural).
 >
-> **Última atualização:** 2026-05-15
+> **Última atualização:** 2026-05-18
+>
+> Frontend correspondente: [`../estoqueia-angular/context.md`](../estoqueia-angular/context.md)
 
 ---
 
@@ -279,7 +281,7 @@ src/test/java/unitins/gestao/estoqueIA/
 
 ## Tarefas futuras
 
-- [ ] Frontend Angular consumindo a API
+- [x] ~~Frontend Angular consumindo a API~~ → ver [`../estoqueia-angular/context.md`](../estoqueia-angular/context.md)
 - [ ] Algoritmo de previsão mais sofisticado (suavização exponencial / regressão)
 - [ ] Endpoint de gráficos para o dashboard (séries temporais)
 - [ ] Job agendado para envio de alertas de baixo estoque (email/Telegram)
@@ -297,6 +299,16 @@ http://localhost:8080/swagger-ui.html → "Authorize" → `Bearer <token>` do lo
 $env:PGPASSWORD="123456"
 psql -U postgres -h localhost -d estoqueia -c "DROP TABLE IF EXISTS movimentacao, produto, categoria, refresh_token, usuario, flyway_schema_history CASCADE;"
 ./mvnw spring-boot:run
+```
+
+### Seed de demonstração
+[`scripts/seed-demo.sql`](scripts/seed-demo.sql) popula 8 categorias, ~42 produtos e ~1.600 movimentações
+(entradas + saídas) com datas espalhadas nos últimos 40 dias, calibradas para exercitar a previsão:
+gera os 4 cenários da IA (abaixo do mínimo, ruptura próxima, estoque adequado, consumo zero).
+Idempotente por nome de produto (rodar de novo não duplica). Requer o usuário `admin@teste.com` (ou cai no 1º usuário).
+```powershell
+$env:PGPASSWORD="123456"
+psql -U postgres -h localhost -d estoqueia -f scripts/seed-demo.sql
 ```
 
 ### Logs/queries SQL (dev)

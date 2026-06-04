@@ -2,7 +2,7 @@
 
 > Documentação viva. Atualizar a cada mudança significativa (nova feature, endpoint, dependência, decisão arquitetural).
 >
-> **Última atualização:** 2026-05-18
+> **Última atualização:** 2026-06-03
 >
 > Frontend correspondente: [`../estoqueia-angular/context.md`](../estoqueia-angular/context.md)
 
@@ -76,6 +76,7 @@ Sobe Postgres + app. Healthcheck do Postgres garante ordem correta.
 | `DB_USER` | `postgres` | sim | Usuário |
 | `DB_PASSWORD` | `postgres` | sim | Senha |
 | `JWT_SECRET` | default dev | **sim** | Chave HMAC, mín. 32 chars |
+| `DEEPSEEK_API_KEY` | (vazio) | p/ usar a IA | Key da DeepSeek; sem ela, `/ia/assistente` responde 422 |
 | `SPRING_PROFILES_ACTIVE` | (vazio) | `prod` no Docker | Ativa application-prod.properties |
 
 ### Profile `prod`
@@ -158,6 +159,26 @@ Algoritmo (em [PrevisaoService.java](src/main/java/unitins/gestao/estoqueIA/serv
 
 > **Status:** v1 simples (média móvel). Próximas iterações podem usar suavização exponencial, sazonalidade ou modelos ML.
 
+### Assistente de IA — LLM (auth required)
+
+| Método | Path | Role | Descrição |
+|---|---|---|---|
+| POST | `/ia/assistente` | qualquer | Pergunta única sobre reposição; responde via DeepSeek |
+| POST | `/ia/chat` | qualquer | Chat de dúvidas multi-turno (uso do sistema + dados do estoque) |
+
+`/ia/assistente` → `{ "pergunta": "o que devo repor essa semana?" }` → `{ "resposta": "..." }`
+
+`/ia/chat` → `{ "mensagens": [{ "papel": "user", "conteudo": "..." }, { "papel": "assistant", "conteudo": "..." }] }` → `{ "resposta": "..." }`
+O backend é **stateless**: o cliente envia o histórico inteiro a cada chamada (máx. 30 mensagens; `papel` é `user` ou `assistant`). O system prompt descreve o sistema **e** injeta o contexto de reposição.
+
+Fluxo (em [IaAssistenteService.java](src/main/java/unitins/gestao/estoqueIA/service/ia/IaAssistenteService.java)):
+1. Busca o contexto real via `PrevisaoService.reposicaoSugerida()` (números determinísticos)
+2. Injeta esse contexto + a pergunta num prompt
+3. Chama a DeepSeek ([DeepSeekClient.java](src/main/java/unitins/gestao/estoqueIA/service/ia/DeepSeekClient.java)) via `RestClient` (API compatível com OpenAI, `POST /chat/completions`)
+4. O LLM apenas **interpreta/prioriza/explica** — não inventa estoque
+
+> Requer `DEEPSEEK_API_KEY` no ambiente. Modelo default `deepseek-chat` (`deepseek.model`). Sem key → 422 com aviso.
+
 ## Fluxo de autenticação
 
 1. **Registrar** (`POST /auth/register`):
@@ -217,14 +238,16 @@ src/main/java/unitins/gestao/estoqueIA/
 │   ├── CategoriaController.java
 │   ├── ProdutoController.java
 │   ├── MovimentacaoController.java
-│   └── PrevisaoController.java     # /previsao/*
+│   ├── PrevisaoController.java     # /previsao/*
+│   └── IaController.java           # /ia/assistente (LLM DeepSeek)
 ├── dto/
 │   ├── auth/      # LoginRequest, RegisterRequest, RefreshRequest, TokenResponse
 │   ├── usuario/   # UsuarioResponse, UsuarioUpdateRequest
 │   ├── categoria/
 │   ├── produto/
 │   ├── movimentacao/
-│   └── previsao/  # PrevisaoResponse
+│   ├── previsao/  # PrevisaoResponse
+│   └── ia/        # AssistenteRequest/Response, ChatRequest/Response, ChatMessage
 ├── entity/
 │   ├── enums/                      # Role, TipoMovimentacao
 │   ├── Usuario.java
@@ -244,6 +267,10 @@ src/main/java/unitins/gestao/estoqueIA/
 │   ├── TokenService.java            # Gera JWT HS256
 │   └── RefreshTokenService.java     # Emite/rotaciona/revoga
 └── service/
+    ├── (Usuario/Categoria/Produto/Movimentacao/Previsao)Service.java
+    └── ia/
+        ├── DeepSeekClient.java       # RestClient p/ DeepSeek (formato OpenAI)
+        └── IaAssistenteService.java  # Monta contexto + prompt, chama o LLM
 
 src/main/resources/
 ├── application.properties            # dev

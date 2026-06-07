@@ -1,10 +1,20 @@
 package unitins.gestao.estoqueIA.service.ia;
 
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
+import unitins.gestao.estoqueIA.dto.analise.ResumoEstoque;
 import unitins.gestao.estoqueIA.dto.ia.ChatMessage;
+import unitins.gestao.estoqueIA.dto.ia.MovimentacaoNlResponse;
 import unitins.gestao.estoqueIA.dto.previsao.PrevisaoResponse;
+import unitins.gestao.estoqueIA.dto.produto.ProdutoResponse;
+import unitins.gestao.estoqueIA.entity.enums.TipoMovimentacao;
+import unitins.gestao.estoqueIA.service.EstoqueAnaliseService;
 import unitins.gestao.estoqueIA.service.PrevisaoService;
+import unitins.gestao.estoqueIA.service.ProdutoService;
+
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -59,7 +69,10 @@ public class IaAssistenteService {
     private static final int MAX_MENSAGENS = 30;
 
     private final PrevisaoService previsaoService;
+    private final EstoqueAnaliseService estoqueAnaliseService;
+    private final ProdutoService produtoService;
     private final DeepSeekClient deepSeekClient;
+    private final ObjectMapper objectMapper;
 
     public String responder(String pergunta) {
         List<PrevisaoResponse> sugestoes = previsaoService.reposicaoSugerida(null);
@@ -101,6 +114,157 @@ public class IaAssistenteService {
         }
 
         return deepSeekClient.chat(mensagens);
+    }
+
+    /**
+     * Resumo executivo do estoque em linguagem natural, para o dashboard.
+     * Os números vêm do {@link EstoqueAnaliseService}; o LLM apenas redige.
+     */
+    public String resumoExecutivo() {
+        ResumoEstoque r = estoqueAnaliseService.resumo();
+        String topReposicao = montarContexto(previsaoService.reposicaoSugerida(null));
+
+        String userPrompt = """
+                Escreva um resumo executivo curto (3 a 5 frases) sobre a situação atual do estoque,
+                em tom profissional, destacando riscos e prioridades. Não invente números.
+
+                ## Indicadores
+                - Produtos ativos: %d
+                - Categorias: %d
+                - Unidades em estoque: %d
+                - Valor imobilizado: R$ %s
+                - Produtos abaixo do mínimo: %d
+                - Produtos com reposição sugerida: %d
+                - Categoria mais crítica: %s
+
+                ## Itens prioritários para reposição
+                %s
+                """.formatted(
+                r.totalProdutosAtivos(),
+                r.totalCategorias(),
+                r.totalUnidades(),
+                r.valorTotalEstoque(),
+                r.produtosAbaixoMinimo(),
+                r.produtosComReposicaoSugerida(),
+                r.categoriaMaisCritica() == null ? "n/d" : r.categoriaMaisCritica(),
+                topReposicao
+        );
+
+        return deepSeekClient.chat(SYSTEM_PROMPT, userPrompt);
+    }
+
+    /**
+     * Gera um rascunho de pedido de compra a partir dos itens com reposição
+     * sugerida e suas quantidades calculadas. É só uma sugestão para o ADMIN.
+     */
+    public String gerarPedidoCompra() {
+        List<PrevisaoResponse> sugestoes = previsaoService.reposicaoSugerida(null);
+        if (sugestoes.isEmpty()) {
+            return "Nenhum produto precisa de reposição no momento. Não há pedido de compra a gerar.";
+        }
+
+        String itens = sugestoes.stream()
+                .map(p -> "- %s | estoque atual: %d | mínimo: %d | quantidade sugerida de compra: %s | motivo: %s"
+                        .formatted(
+                                p.produtoNome(),
+                                p.quantidadeAtual(),
+                                p.estoqueMinimo(),
+                                p.quantidadeSugerida() == null ? "n/d" : p.quantidadeSugerida(),
+                                p.motivo()))
+                .collect(Collectors.joining("\n"));
+
+        String userPrompt = """
+                Monte um rascunho de PEDIDO DE COMPRA com base na lista abaixo. Para cada item,
+                liste o produto e a quantidade sugerida de compra. Ordene pelos mais urgentes
+                (menor folga / abaixo do mínimo primeiro). Ao final, escreva uma linha de
+                observação lembrando que é uma sugestão a ser revisada pelo responsável.
+                Use as quantidades fornecidas; não invente novos números.
+
+                ## Itens sugeridos
+                %s
+                """.formatted(itens);
+
+        return deepSeekClient.chat(SYSTEM_PROMPT, userPrompt);
+    }
+
+    /**
+     * Interpreta uma frase como "dei baixa de 10 parafusos" e devolve uma
+     * pré-visualização estruturada (tipo, quantidade, produto). NÃO grava nada:
+     * o cliente confirma e chama POST /movimentacoes.
+     */
+    public MovimentacaoNlResponse interpretarMovimentacao(String texto) {
+        String system = """
+                Extraia de uma frase a intenção de movimentação de estoque e responda SOMENTE com
+                um JSON válido, sem texto extra, sem markdown, no formato exato:
+                {"tipo":"ENTRADA"|"SAIDA","quantidade":<inteiro>,"produto":"<nome do produto>"}
+                "ENTRADA" = chegada/compra/reposição; "SAIDA" = baixa/venda/consumo.
+                Se não conseguir identificar, responda {"tipo":null,"quantidade":null,"produto":null}.
+                """;
+
+        String resposta = deepSeekClient.chat(system, texto);
+        JsonNode json;
+        try {
+            json = objectMapper.readTree(limparJson(resposta));
+        } catch (Exception e) {
+            return new MovimentacaoNlResponse(false, null, null, null, null,
+                    "Não consegui interpretar a frase. Reformule, ex.: \"saída de 10 unidades de Mouse\".");
+        }
+
+        String tipoTxt = textoOuNull(json, "tipo");
+        Integer quantidade = inteiroOuNull(json, "quantidade");
+        String produtoBusca = textoOuNull(json, "produto");
+
+        if (tipoTxt == null || quantidade == null || quantidade <= 0 || produtoBusca == null) {
+            return new MovimentacaoNlResponse(false, null, null, null, null,
+                    "Não consegui identificar tipo, quantidade e produto na frase.");
+        }
+
+        TipoMovimentacao tipo;
+        try {
+            tipo = TipoMovimentacao.valueOf(tipoTxt.trim().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return new MovimentacaoNlResponse(false, null, null, null, null,
+                    "Tipo de movimentação inválido: " + tipoTxt);
+        }
+
+        List<ProdutoResponse> encontrados = produtoService
+                .listar(produtoBusca, PageRequest.of(0, 5)).getContent();
+        if (encontrados.isEmpty()) {
+            return new MovimentacaoNlResponse(false, null, null, tipo, quantidade,
+                    "Não encontrei nenhum produto parecido com \"" + produtoBusca + "\".");
+        }
+
+        ProdutoResponse p = encontrados.get(0);
+        String aviso = encontrados.size() > 1
+                ? " (havia mais de um produto parecido; confirme se é o correto)"
+                : "";
+        return new MovimentacaoNlResponse(true, p.id(), p.nome(), tipo, quantidade,
+                "Confirme para registrar %s de %d unidade(s) de \"%s\".%s"
+                        .formatted(tipo, quantidade, p.nome(), aviso));
+    }
+
+    private String limparJson(String texto) {
+        if (texto == null) return "{}";
+        String t = texto.trim();
+        // remove cercas de código ```json ... ```
+        if (t.startsWith("```")) {
+            int ini = t.indexOf('{');
+            int fim = t.lastIndexOf('}');
+            if (ini >= 0 && fim >= ini) {
+                return t.substring(ini, fim + 1);
+            }
+        }
+        return t;
+    }
+
+    private String textoOuNull(JsonNode node, String campo) {
+        JsonNode n = node.get(campo);
+        return n != null && !n.isNull() ? n.asString() : null;
+    }
+
+    private Integer inteiroOuNull(JsonNode node, String campo) {
+        JsonNode n = node.get(campo);
+        return n != null && n.isNumber() ? n.asInt() : null;
     }
 
     private String montarContexto(List<PrevisaoResponse> sugestoes) {

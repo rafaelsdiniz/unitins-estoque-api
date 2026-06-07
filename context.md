@@ -2,7 +2,7 @@
 
 > Documentação viva. Atualizar a cada mudança significativa (nova feature, endpoint, dependência, decisão arquitetural).
 >
-> **Última atualização:** 2026-06-03
+> **Última atualização:** 2026-06-07
 >
 > Frontend correspondente: [`../estoqueia-angular/context.md`](../estoqueia-angular/context.md)
 
@@ -74,7 +74,7 @@ Sobe Postgres + app. Healthcheck do Postgres garante ordem correta.
 | `DB_PORT` | `5432` | não | Porta do Postgres |
 | `DB_NAME` | `estoqueia` | sim | Nome do banco |
 | `DB_USER` | `postgres` | sim | Usuário |
-| `DB_PASSWORD` | `postgres` | sim | Senha |
+| `DB_PASSWORD` | `123456` | sim | Senha (default dev = 123456) |
 | `JWT_SECRET` | default dev | **sim** | Chave HMAC, mín. 32 chars |
 | `DEEPSEEK_API_KEY` | (vazio) | p/ usar a IA | Key da DeepSeek; sem ela, `/ia/assistente` responde 422 |
 | `SPRING_PROFILES_ACTIVE` | (vazio) | `prod` no Docker | Ativa application-prod.properties |
@@ -157,25 +157,57 @@ Algoritmo (em [PrevisaoService.java](src/main/java/unitins/gestao/estoqueIA/serv
    - `quantidade < estoqueMinimo`, OU
    - `diasAteRuptura <= tempoReposicaoDias`
 
-> **Status:** v1 simples (média móvel). Próximas iterações podem usar suavização exponencial, sazonalidade ou modelos ML.
+**Inteligência adicional (v2)** — campos extra no `PrevisaoResponse`:
+- `consumoMedioPonderado` — média móvel exponencial (EWMA, α=0.3): reage mais rápido a mudanças recentes.
+- `tendencia` — `ALTA` | `BAIXA` | `ESTAVEL` | `SEM_DADOS` (compara 1ª vs 2ª metade da janela).
+- `quantidadeSugerida` — quanto comprar = cobrir o lead time + repor o estoque mínimo (≥ 0).
+- `nivelConfianca` — `ALTA` (≥10 movs) | `MEDIA` (3–9) | `BAIXA` (<3) na janela.
+- `movimentacoesSaidaNaJanela` — nº de saídas observadas.
+
+> **Status:** v2 (média móvel simples + EWMA + tendência + quantidade sugerida). Sem mudança de schema. Próximo: sazonalidade / ML.
+
+### Análise de estoque (auth required)
+
+| Método | Path | Role | Descrição |
+|---|---|---|---|
+| GET | `/analise/resumo` | qualquer | Visão executiva: totais, valor imobilizado, nº abaixo do mínimo, categoria mais crítica |
+| GET | `/analise/curva-abc` | qualquer | Curva ABC por valor imobilizado (classes A≤80%, B≤95%, C resto) |
+| GET | `/analise/anomalias?janelaDias=` | qualquer | `PICO_SAIDA` (saída >5× consumo médio) e `ESTOQUE_PARADO` (sem saída, mas com estoque) |
+
+Tudo determinístico, em [EstoqueAnaliseService.java](src/main/java/unitins/gestao/estoqueIA/service/EstoqueAnaliseService.java). Serve ao dashboard **e** à IA (como ferramentas/contexto).
 
 ### Assistente de IA — LLM (auth required)
 
 | Método | Path | Role | Descrição |
 |---|---|---|---|
 | POST | `/ia/assistente` | qualquer | Pergunta única sobre reposição; responde via DeepSeek |
-| POST | `/ia/chat` | qualquer | Chat de dúvidas multi-turno (uso do sistema + dados do estoque) |
+| POST | `/ia/chat` | qualquer | Chat de dúvidas multi-turno (uso do sistema + dados do estoque, contexto fixo) |
+| POST | `/ia/agente` | qualquer | **Agente com ferramentas**: consulta o sistema sob demanda (function calling) |
+| GET | `/ia/resumo` | qualquer | Resumo executivo do estoque em linguagem natural |
+| GET | `/ia/pedido-compra` | qualquer | Rascunho de pedido de compra a partir das reposições sugeridas |
+| POST | `/ia/movimentacao-nl` | qualquer | Interpreta "dei baixa de 10 mouses" → preview `{produtoId, tipo, quantidade}` (não grava) |
 
 `/ia/assistente` → `{ "pergunta": "o que devo repor essa semana?" }` → `{ "resposta": "..." }`
 
-`/ia/chat` → `{ "mensagens": [{ "papel": "user", "conteudo": "..." }, { "papel": "assistant", "conteudo": "..." }] }` → `{ "resposta": "..." }`
-O backend é **stateless**: o cliente envia o histórico inteiro a cada chamada (máx. 30 mensagens; `papel` é `user` ou `assistant`). O system prompt descreve o sistema **e** injeta o contexto de reposição.
+`/ia/chat` e `/ia/agente` → `{ "mensagens": [{ "papel": "user", "conteudo": "..." }, ...] }` → `{ "resposta": "..." }`
+Backend **stateless**: o cliente envia o histórico inteiro a cada chamada (`papel` é `user` ou `assistant`).
 
-Fluxo (em [IaAssistenteService.java](src/main/java/unitins/gestao/estoqueIA/service/ia/IaAssistenteService.java)):
+`/ia/movimentacao-nl` → `{ "texto": "saída de 10 unidades de Mouse" }` →
+`{ "interpretado": true, "produtoId": 1, "produtoNome": "Mouse", "tipo": "SAIDA", "quantidade": 10, "mensagem": "..." }`.
+É só pré-visualização: para efetivar, o cliente confirma e chama `POST /movimentacoes`.
+
+**Chat com contexto fixo** ([IaAssistenteService.java](src/main/java/unitins/gestao/estoqueIA/service/ia/IaAssistenteService.java)):
 1. Busca o contexto real via `PrevisaoService.reposicaoSugerida()` (números determinísticos)
 2. Injeta esse contexto + a pergunta num prompt
-3. Chama a DeepSeek ([DeepSeekClient.java](src/main/java/unitins/gestao/estoqueIA/service/ia/DeepSeekClient.java)) via `RestClient` (API compatível com OpenAI, `POST /chat/completions`)
+3. Chama a DeepSeek via `RestClient` (API compatível com OpenAI, `POST /chat/completions`)
 4. O LLM apenas **interpreta/prioriza/explica** — não inventa estoque
+
+**Agente com ferramentas** ([IaAgenteService.java](src/main/java/unitins/gestao/estoqueIA/service/ia/IaAgenteService.java)):
+O LLM recebe definições de **ferramentas** e decide quais chamar. Loop (máx. 5 iterações): modelo
+pede `tool_calls` → executamos os serviços reais → devolvemos o JSON do resultado → modelo conclui.
+Ferramentas: `resumo_estoque`, `reposicao_sugerida`, `prever_produto`, `buscar_produto`,
+`curva_abc`, `anomalias`, `historico_movimentacao`. O suporte a function calling está no
+[DeepSeekClient.java](src/main/java/unitins/gestao/estoqueIA/service/ia/DeepSeekClient.java).
 
 > Requer `DEEPSEEK_API_KEY` no ambiente. Modelo default `deepseek-chat` (`deepseek.model`). Sem key → 422 com aviso.
 
@@ -239,7 +271,8 @@ src/main/java/unitins/gestao/estoqueIA/
 │   ├── ProdutoController.java
 │   ├── MovimentacaoController.java
 │   ├── PrevisaoController.java     # /previsao/*
-│   └── IaController.java           # /ia/assistente (LLM DeepSeek)
+│   ├── AnaliseController.java      # /analise/* (resumo, curva ABC, anomalias)
+│   └── IaController.java           # /ia/* (assistente, chat, agente, resumo, pedido, mov-nl)
 ├── dto/
 │   ├── auth/      # LoginRequest, RegisterRequest, RefreshRequest, TokenResponse
 │   ├── usuario/   # UsuarioResponse, UsuarioUpdateRequest
@@ -268,9 +301,11 @@ src/main/java/unitins/gestao/estoqueIA/
 │   └── RefreshTokenService.java     # Emite/rotaciona/revoga
 └── service/
     ├── (Usuario/Categoria/Produto/Movimentacao/Previsao)Service.java
+    ├── EstoqueAnaliseService.java    # Resumo, curva ABC, anomalias (determinístico)
     └── ia/
-        ├── DeepSeekClient.java       # RestClient p/ DeepSeek (formato OpenAI)
-        └── IaAssistenteService.java  # Monta contexto + prompt, chama o LLM
+        ├── DeepSeekClient.java       # RestClient p/ DeepSeek (formato OpenAI) + function calling
+        ├── IaAssistenteService.java  # Chat com contexto fixo + resumo/pedido/movimentação-NL
+        └── IaAgenteService.java      # Agente com ferramentas (loop de tool calling)
 
 src/main/resources/
 ├── application.properties            # dev
@@ -297,7 +332,9 @@ src/test/java/unitins/gestao/estoqueIA/
 - **Refresh token opaco** (não JWT) → revogável por DB.
 - **Rotação de refresh** → emitir novo invalida o antigo, mitigando reuso.
 - **CORS** liberado apenas para `http://localhost:4200` (dev do Angular).
-- **Previsão v1 = média móvel** → algoritmo simples, defensável e testável.
+- **Previsão = média móvel + EWMA** → simples e testável; EWMA adiciona reatividade sem schema novo.
+- **Números determinísticos, IA só interpreta** → previsão/análise calculadas em Java; o LLM nunca inventa estoque. No agente, a IA acessa esses números via **function calling** (ferramentas), não por contexto colado.
+- **IA não grava direto** → `/ia/movimentacao-nl` devolve preview; a escrita continua passando por `POST /movimentacoes` com suas regras.
 - **springdoc 2.8.13** → versões ≤2.6 quebram com `NoSuchMethodError` em Spring 7.
 - **`spring-boot-flyway`** (não `flyway-core` direto) → necessário pra auto-config do Spring Boot 4.
 
@@ -309,7 +346,10 @@ src/test/java/unitins/gestao/estoqueIA/
 ## Tarefas futuras
 
 - [x] ~~Frontend Angular consumindo a API~~ → ver [`../estoqueia-angular/context.md`](../estoqueia-angular/context.md)
-- [ ] Algoritmo de previsão mais sofisticado (suavização exponencial / regressão)
+- [x] ~~Suavização exponencial (EWMA) + tendência + quantidade sugerida + confiança~~ (v2)
+- [x] ~~Análise de estoque (resumo executivo, curva ABC, anomalias)~~ → `/analise/*`
+- [x] ~~IA como agente com function calling~~ → `/ia/agente`
+- [ ] Algoritmo de previsão ainda mais sofisticado (sazonalidade / regressão / ML)
 - [ ] Endpoint de gráficos para o dashboard (séries temporais)
 - [ ] Job agendado para envio de alertas de baixo estoque (email/Telegram)
 - [ ] CI (GitHub Actions): build + testes em PR

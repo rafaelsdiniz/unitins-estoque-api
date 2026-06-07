@@ -23,6 +23,16 @@ public interface MovimentacaoRepository extends JpaRepository<Movimentacao, Long
             LocalDateTime fim
     );
 
+    /**
+     * Movimentações de um tipo (ex.: SAIDA) a partir de uma data, em ordem
+     * cronológica. Base para a média ponderada (EWMA) e a tendência.
+     */
+    List<Movimentacao> findByProdutoIdAndTipoAndDataHoraGreaterThanEqualOrderByDataHoraAsc(
+            Long produtoId,
+            TipoMovimentacao tipo,
+            LocalDateTime desde
+    );
+
     @Query("""
         SELECT COALESCE(SUM(m.quantidade), 0)
         FROM Movimentacao m
